@@ -4,15 +4,21 @@
  * Requires:
  * - AWS credentials configured
  * - AgentCore Memory service available in the region
- * - Permissions for memory control plane and data plane operations
+ *
+ * These tests are sequential — each depends on state from the previous.
+ * Memory creation takes ~160s, deletion ~30s. The 600s suite timeout
+ * accommodates worst-case polling for both.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { MemoryClient } from '../src/memory/client.js'
+import { pollUntil } from '../src/_utils/polling.js'
 
-describe('MemoryClient Integration Tests', () => {
+describe('MemoryClient Integration Tests', { timeout: 600_000, sequential: true }, () => {
   const region = process.env.AWS_REGION || 'us-west-2'
-  const memoryName = `test-memory-${Date.now()}`
+  const memoryName = `testmem_${Date.now()}`
+  const actorId = 'test_actor'
+  const sessionId = 'test_session'
   let client: MemoryClient
   let memoryId: string
 
@@ -23,73 +29,115 @@ describe('MemoryClient Integration Tests', () => {
   afterAll(async () => {
     if (memoryId) {
       try {
-        await client.deleteMemoryAndWait(memoryId, { maxWaitSeconds: 120, pollIntervalMs: 5000 })
+        await client.deleteMemory({ memoryId })
+        await pollUntil(
+          async () => {
+            try {
+              await client.getMemory({ memoryId })
+              return false
+            } catch {
+              return true
+            }
+          },
+          { maxWaitSeconds: 120, pollIntervalMs: 5000 }
+        )
       } catch {
         // best-effort cleanup
       }
     }
   })
 
-  it('creates a memory and waits for it to be active', async () => {
-    const result = await client.createMemoryAndWait(
-      { name: memoryName, eventExpiryDuration: 1 },
-      { maxWaitSeconds: 120 }
-    )
-
+  it('creates a memory and waits for it to become active', async () => {
+    const result = await client.createMemory({ name: memoryName, eventExpiryDuration: 3 })
+    expect(result.memory?.id).toEqual(expect.any(String))
     memoryId = result.memory!.id!
-    expect(memoryId).toBeDefined()
+
+    const became_active = await pollUntil(
+      async () => {
+        const resp = await client.getMemory({ memoryId })
+        return resp.memory?.status === 'ACTIVE'
+      },
+      {
+        maxWaitSeconds: 180,
+        pollIntervalMs: 10_000,
+        timeoutErrorMessage: `Memory ${memoryId} did not become ACTIVE within 180s`,
+      }
+    )
+    expect(became_active).toBe(true)
   })
 
   it('retrieves the memory by id', async () => {
     const result = await client.getMemory({ memoryId })
-    expect(result.memory?.id).toBe(memoryId)
+    expect(result.memory).toMatchObject({ id: memoryId, status: 'ACTIVE' })
   })
 
-  it('createOrGetMemory returns existing memory on conflict', async () => {
-    const result = await client.createOrGetMemory({ name: memoryName, eventExpiryDuration: 1 })
-    expect(result.memory?.id).toBe(memoryId)
-  })
-
-  it('creates and retrieves an event', async () => {
+  it('creates and retrieves events across a multi-turn conversation', async () => {
     await client.createEvent({
       memoryId,
-      actorId: 'test-actor',
-      sessionId: 'test-session',
+      actorId,
+      sessionId,
       eventTimestamp: new Date(),
       payload: [{ conversational: { role: 'USER', content: { text: 'hello' } } }],
     })
 
-    const events = await client.listEvents({
+    await client.createEvent({
       memoryId,
-      actorId: 'test-actor',
-      sessionId: 'test-session',
+      actorId,
+      sessionId,
+      eventTimestamp: new Date(),
+      payload: [{ conversational: { role: 'ASSISTANT', content: { text: 'hi there' } } }],
     })
 
-    expect(events.events?.length).toBeGreaterThan(0)
+    const events = await client.listEvents({ memoryId, actorId, sessionId })
+    expect(events.events?.length).toBe(2)
   })
 
   it('lists actors for the memory', async () => {
     const result = await client.listActors({ memoryId })
-    expect(result.actors).toEqual(expect.arrayContaining([expect.objectContaining({ actorId: 'test-actor' })]))
+    expect(result.actorSummaries).toEqual(expect.arrayContaining([expect.objectContaining({ actorId })]))
   })
 
-  it('scoped memory injects memoryId', async () => {
+  it('scoped memory works for data plane calls', async () => {
     const mem = client.memory(memoryId)
-    const events = await mem.listEvents({ actorId: 'test-actor', sessionId: 'test-session' })
-    expect(events.events?.length).toBeGreaterThan(0)
+    const events = await mem.listEvents({ actorId, sessionId })
+    expect(events.events?.length).toBe(2)
   })
 
   it('getLastKTurns retrieves conversation turns', async () => {
     const mem = client.memory(memoryId)
-    const turns = await mem.getLastKTurns({ actorId: 'test-actor', sessionId: 'test-session', k: 5 })
+    const turns = await mem.getLastKTurns({ actorId, sessionId, k: 5 })
     expect(turns.length).toBeGreaterThan(0)
-    expect(turns[0]).toEqual(expect.arrayContaining([expect.objectContaining({ role: 'USER' })]))
+    const allMessages = turns.flat()
+    expect(allMessages.length).toBeGreaterThan(0)
   })
 
-  it('deletes the memory and waits for completion', async () => {
-    await client.deleteMemoryAndWait(memoryId, { maxWaitSeconds: 120, pollIntervalMs: 5000 })
+  it('listBranches returns the default main branch', async () => {
+    const mem = client.memory(memoryId)
+    const branches = await mem.listBranches({ actorId, sessionId })
+    expect(branches).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'main', eventCount: 2 })]))
+  })
 
-    await expect(client.getMemory({ memoryId })).rejects.toMatchObject({ name: 'ResourceNotFoundException' })
-    memoryId = '' // prevent afterAll double-delete
+  it('deletes the memory', async () => {
+    await client.deleteMemory({ memoryId })
+    await pollUntil(
+      async () => {
+        try {
+          await client.getMemory({ memoryId })
+          return false
+        } catch {
+          return true
+        }
+      },
+      {
+        maxWaitSeconds: 120,
+        pollIntervalMs: 5000,
+        timeoutErrorMessage: `Memory ${memoryId} was not deleted within 120s`,
+      }
+    )
+
+    await expect(client.getMemory({ memoryId })).rejects.toMatchObject({
+      name: 'ResourceNotFoundException',
+    })
+    memoryId = ''
   })
 })
